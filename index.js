@@ -1,144 +1,132 @@
 const mineflayer = require('mineflayer');
 const pathfinder = require('mineflayer-pathfinder').pathfinder;
 const Movements = require('mineflayer-pathfinder').Movements;
-const GoalFollow = require('mineflayer-pathfinder').goals.GoalFollow;
+const GoalBlock = require('mineflayer-pathfinder').goals.GoalBlock;
 const autoeat = require('mineflayer-auto-eat').plugin;
-const pvp = require('mineflayer-pvp').plugin; 
+const collectBlock = require('mineflayer-collectblock').plugin;
+const { GoalGetToBlock } = require('mineflayer-pathfinder').goals;
 
 // =========================================================================
 // ⚠️ 1. AYARLAR: LÜTFEN SADECE AŞAĞIDAKİ BİLGİLERİ DOLDURUN
 // =========================================================================
 
-const SUNUCU_ADRESI = 'SUNUCU_IPSI_BURAYA_GELECEK'; // Örn: 'oyun.sunucum.com'
-const BOT_VERSION = 'SUNUCU_SURUMU_BURAYA_GELECEK'; // Örn: '1.20.4'
+const SUNUCU_ADRESI = 'SUNUCU_IPSI_BURAYA_GELECEK'; 
+const BOT_VERSION = 'SUNUCU_SURUMU_BURAYA_GELECEK'; 
+const MAIN_PLAYER_NAME = 'LUTFEN_KENDI_OYUNCU_ADINIZI_GIRIN'; // KORUNACAK KİŞİ ADI (Gerekli değil ama güvenlik için ekli)
 
-// KORUNACAK KİŞİ (SENİN OYUNCU ADIN)
-const MAIN_PLAYER_NAME = 'SENIN_OYUNCU_ISMIN_BURAYA_GELECEK'; 
+// BU BOTA AİT HESAP BİLGİLERİ (3. Hesap)
+const BOT_HESABI_EMAIL = 'madencibot3@gmail.com'; 
+const BOT_HESABI_SIFRE = 'bot3sifre';
 
-// PREMIUM HESAP BİLGİLERİ
-const BOT_HESABI_EMAIL = 'madencibot@gmail.com'; 
-const BOT_HESABI_SIFRE = 'madencibot3113';
-
-// ÜS VE GÖREV KOORDİNATLARI
-let BASE_KOORDINAT = null; // /üs ayarla ile botun geri döneceği yer
-let SANDIK_KOORDINAT = null; // /sandık ayarla ile botun eşya bırakacağı sandık
-let KAPI_KOORDINAT = null; // /kapı ayarla ile botun nöbet tutacağı yer
+// GÖREV KOORDİNATLARI
+let SANDIK_KOORDINAT = null; // /sandık ayarla ile eşya bırakılacak yer
+let MADEN_ALANI_BLOK_ISMI = 'coal_ore'; // Madencilik hedefi
+let MADEN_ALANI_YARI_CAP = 10; // Botun ne kadar uzağa gideceği (512MB RAM için küçük tutuldu)
 
 // =========================================================================
-// 2. BOT DURUM YÖNETİMİ VE İKİ GÖREV MODU
+// 2. BOT DURUM YÖNETİMİ
 // =========================================================================
 
 const STATE = {
-    FOLLOWING: 'takip',
-    GUARDING_GATE: 'kapinobeti',
+    MINING: 'madencilik',
     HUNTING: 'avlanma',
     EMPTYING: 'bosaltma',
-    FIGHTING: 'savunma'
+    IDLE: 'bos'
 };
 
-let current_state = STATE.FOLLOWING;
+let current_state = STATE.IDLE;
 
 // =========================================================================
 // 3. ÇEKİRDEK GÖREVLER
 // =========================================================================
 
-// En iyi silahı kuşanma
-function equipBestWeapon(bot) {
-    const bestWeapon = bot.inventory.items().reduce((best, item) => {
-        if (!item.name.includes('sword') && !item.name.includes('axe')) return best;
-        const damage = item.nbt?.value.display?.value.Lore?.value[0]?.value.includes('Damage') ? 
-                       parseFloat(item.nbt.value.display.value.Lore.value[0].value.match(/(\d+\.?\d*)/)[0]) : 
-                       (item.name.includes('diamond_sword') ? 7 : 4); // Basit bir tahmin
-        if (!best || damage > best.damage) {
-            return { item: item, damage: damage };
+// Sandık Koordinatına git ve boşaltma
+async function startEmptying(bot) {
+    if (!SANDIK_KOORDINAT) {
+        bot.chat('HATA: Sandık koordinatları ayarlanmamış!');
+        return startMining(bot); 
+    }
+    
+    current_state = STATE.EMPTYING;
+    bot.chat('Envanter dolu, sandığa boşaltmaya gidiyorum.');
+
+    // Sandığa git
+    await bot.pathfinder.goto(new GoalBlock(SANDIK_KOORDINAT.x, SANDIK_KOORDINAT.y, SANDIK_KOORDINAT.z));
+
+    const sandikBlok = bot.blockAt(SANDIK_KOORDINAT);
+    if (!sandikBlok || !sandikBlok.name.includes('chest')) {
+        bot.chat('HATA: Sandık yok!');
+        return startMining(bot);
+    }
+
+    const sandik = await bot.openContainer(sandikBlok);
+    
+    // Yemeği tut, gerisini boşalt
+    for (const item of bot.inventory.items()) {
+        if (!item.name.includes('cooked_') && !item.name.includes('steak')) { 
+            await sandik.deposit(item.type, item.metadata, item.count);
         }
-        return best;
-    }, null);
-
-    if (bestWeapon) {
-        bot.equip(bestWeapon.item, 'hand', () => {
-             // En iyi kılıcı kuşandık
-        });
     }
+    await sandik.close();
+    bot.chat('Envanter temizlendi. Madenciliğe devam.');
+    startMining(bot);
 }
 
-// Oyuncuyu Takip Etme ve Koruma
-function startFollowing(bot) {
-    if (current_state !== STATE.FOLLOWING) {
-        bot.pvp.stop();
-        bot.pathfinder.stop();
-    }
-    current_state = STATE.FOLLOWING;
-    bot.chat('Sizi takip modundayım.');
-    
-    // 5 blok mesafeden takip et
-    const player = bot.players[MAIN_PLAYER_NAME]?.entity;
-    if (player) {
-        bot.pathfinder.setGoal(new GoalFollow(player, 5), true);
-    } else {
-        // Oyuncu yoksa kapı nöbetine geç
-        bot.chat('Kullanıcı sunucuda değil. Kapı nöbetine geçiyorum.');
-        startGateGuard(bot);
-    }
-}
-
-// Kapı Nöbeti Modu
-function startGateGuard(bot) {
-    if (!KAPI_KOORDINAT) {
-        bot.chat('HATA: Kapı koordinatları ayarlanmamış!');
-        startFollowing(bot); // Kapı yoksa takip etmeye geri dön
-        return;
-    }
-    
-    current_state = STATE.GUARDING_GATE;
-    bot.pvp.stop();
-    bot.chat('Kapı nöbeti görevine başlıyorum.');
-
-    const goal = new GoalFollow(bot.entity, 0); // Yerinde kal
-    bot.pathfinder.setGoal(goal, false, () => {
-        // Kapı koordinatına git
-        bot.pathfinder.setGoal(new GoalBlock(KAPI_KOORDINAT.x, KAPI_KOORDINAT.y, KAPI_KOORDINAT.z), true);
-    });
-}
-
-// Avlanma ve Yemek Tedariki
-function startHunting(bot) {
-    if (current_state !== STATE.HUNTING && bot.inventory.emptySlotCount() <= 2) {
-        // Envanter doluysa avlanma
-        bot.chat('Avlanmaya gitmeden önce envanteri boşaltmalıyım.');
+// Madencilik ve Malzeme Toplama
+async function startMining(bot) {
+    if (bot.inventory.emptySlotCount() <= 2) {
         return startEmptying(bot);
     }
+    current_state = STATE.MINING;
+    
+    // Yakında MADEN_ALANI_BLOK_ISMI ara
+    const hedefBlok = bot.findBlock({
+        matching: (block) => block.name === MADEN_ALANI_BLOK_ISMI,
+        maxDistance: MADEN_ALANI_YARI_CAP,
+        count: 1
+    });
 
+    if (!hedefBlok) {
+        bot.chat('Yakında hedef cevher bulunamadı. Başka bir yere gidiyorum.');
+        // Rastgele bir yere kısa mesafe git
+        const rastgeleHedef = bot.entity.position.offset(Math.random() * 5 - 2.5, 0, Math.random() * 5 - 2.5);
+        await bot.pathfinder.goto(new GoalGetToBlock(rastgeleHedef.x, rastgeleHedef.y, rastgeleHedef.z));
+        return setTimeout(() => startMining(bot), 5000); // 5 saniye sonra tekrar dene
+    }
+
+    bot.chat(`${hedefBlok.name} bloğunu kazmaya başlıyorum.`);
+    // Blok kazma (CollectBlock eklentisi kullanılıyor)
+    await bot.collectBlock.collect(hedefBlok, { ignorePath: false, count: 1 });
+    
+    startMining(bot); // Kazma bitince devam et
+}
+
+// Avlanma ve Pişirme (Otonom Hayatta Kalma)
+async function startHunting(bot) {
     current_state = STATE.HUNTING;
     bot.chat('Yemek stoğu kritik, avlanmaya gidiyorum.');
 
+    // Yemek pişirme mantığı (RAM'i zorlamamak için basitleştirildi)
+    const rawEt = bot.inventory.items().find(item => item.name.includes('_mutton') || item.name.includes('_porkchop'));
+
+    if (rawEt) {
+        bot.chat('Pişirme görevi şimdilik atlanmıştır (RAM optimizasyonu).');
+    }
+    
     const hedef = bot.nearestEntity((entity) => {
         return entity.name === 'pig' || entity.name === 'cow' || entity.name === 'chicken';
     });
 
     if (hedef) {
-        bot.pvp.attack(hedef); // pvp eklentisi ile hedefe saldır
+        bot.setControlState('forward', true); 
+        bot.attack(hedef);
+        setTimeout(() => bot.setControlState('forward', false), 2000); // 2 saniye saldır
     } else {
-        bot.chat('Yakında av yok. Takibe dönüyorum.');
-        setTimeout(() => startFollowing(bot), 10000);
+        bot.chat('Yakında av yok. Madenciliğe dönüyorum.');
+        setTimeout(() => startMining(bot), 10000);
     }
 }
 
-// Sandığa eşya boşaltma
-async function startEmptying(bot) {
-    if (!SANDIK_KOORDINAT) {
-        bot.chat('HATA: Sandık koordinatları ayarlanmamış!');
-        startFollowing(bot);
-        return;
-    }
-    current_state = STATE.EMPTYING;
-    // Detaylı sandık boşaltma mantığı buraya eklenecek (RAM limitini zorlamamak için basitleştirildi)
-    
-    bot.chat('Sandığa gidip envanteri boşaltıyorum.');
-    // Kod sandık koordinatına gidecek, boşaltacak ve sonra takibe dönecek
-    // (Kodun bu kısmı RAM limitini aşmamak için PATHFINDER döngüsüne bırakılmıştır)
-    startFollowing(bot); // Basitçe takibe geri dönüyoruz
-}
 
 // =========================================================================
 // 4. BOT BAŞLATMA VE OLAY YÖNETİMİ
@@ -155,78 +143,56 @@ const bot = mineflayer.createBot({
 
 bot.loadPlugin(pathfinder);
 bot.loadPlugin(autoeat);
-bot.loadPlugin(pvp);
+bot.loadPlugin(collectBlock);
 
 bot.on('spawn', () => {
     const mcData = require('minecraft-data')(bot.version);
     const defaultMove = new Movements(bot, mcData);
     bot.pathfinder.setMovements(defaultMove);
     
-    bot.chat(`[Süper Koruma Botu] Hazır! Sayın ${MAIN_PLAYER_NAME}, sizi bekliyorum.`);
-    equipBestWeapon(bot);
-    startFollowing(bot); 
+    bot.chat(`[Madenci Botu] Hazır! Cevher hedefi: ${MADEN_ALANI_BLOK_ISMI}`);
+    startMining(bot); 
 });
 
-// PvP: Düşman Görünce Saldırı
-bot.on('physic', () => {
-    // Sadece takip/nöbet modundayken otomatik saldırı
-    if (current_state === STATE.FOLLOWING || current_state === STATE.GUARDING_GATE) {
-        const hedef = bot.nearestEntity((entity) => {
-            return entity.type === 'mob' || (entity.type === 'player' && entity.username !== MAIN_PLAYER_NAME && bot.pvp.target === null);
-        });
-
-        if (hedef) {
-            bot.pvp.attack(hedef);
-            current_state = STATE.FIGHTING;
-        } else if (bot.pvp.target && !bot.pvp.target.isValid) {
-            bot.pvp.stop();
-            // Savaşı bitirince ana göreve dön
-            if (current_state === STATE.FIGHTING) startFollowing(bot);
-        }
-    }
-});
-
-
-// Can ve Açlık Kontrolü (Hayatta Kalma)
-bot.on('health', () => {
-    // Kritik durumda (Can < 10) ve savaşta değilse kaçış/yardım çağrısı
-    if (bot.health < 10 && current_state !== STATE.FIGHTING) {
-        bot.chat(`Yardım! Canım çok az: ${Math.floor(bot.health)}`);
-        // Otomatik kaçış mantığı buraya eklenebilir, şimdilik sadece uyarıyoruz.
-    }
-    
-    // Yemek stoğu kontrolü (Boşta kaldığında avlansın)
+// Envanter/Açlık Kontrolü
+bot.on('autoeat_stopped', () => {
     const yiyecek = bot.inventory.items().find(item => item.name.includes('cooked_') || item.name.includes('steak'));
-    if (!yiyecek && current_state !== STATE.HUNTING && current_state !== STATE.FIGHTING) {
+    if (!yiyecek && current_state !== STATE.HUNTING) {
         startHunting(bot);
     }
 });
 
-// Chat Komutları (Mod Değiştirme)
+bot.on('inventorySlotChanged', () => {
+    if (bot.inventory.emptySlotCount() <= 2 && current_state !== STATE.EMPTYING) {
+        startEmptying(bot);
+    }
+});
+
+// Chat Komutları
 bot.on('chat', (username, message) => {
     if (username !== MAIN_PLAYER_NAME) return;
 
     const msg = message.toLowerCase();
     
-    if (msg.includes('kapı ayarla')) {
-        const pos = bot.entity.position; 
-        KAPI_KOORDINAT = pos.clone();
-        bot.chat(`[AYAR] Kapı nöbet koordinatı ayarlandı.`);
-        startGateGuard(bot); // Ayarlayınca hemen nöbete başla
-    } else if (msg.includes('takip et')) {
-        startFollowing(bot);
-    } else if (msg.includes('avlan')) {
-        startHunting(bot);
-    } else if (msg.includes('sandık ayarla')) {
-         const sandik_block = bot.targetDigBlock; 
+    if (msg.includes('sandık ayarla')) {
+        const sandik_block = bot.targetDigBlock; 
         if (sandik_block) {
             SANDIK_KOORDINAT = sandik_block.position.clone();
             bot.chat(`[AYAR] Sandık koordinatı ayarlandı.`);
         }
+    } else if (msg.includes('maden yap')) {
+        startMining(bot);
+    } else if (msg.includes('hedef')) {
+        const parts = msg.split(' ');
+        if (parts.length > 1) {
+            MADEN_ALANI_BLOK_ISMI = parts[1];
+            bot.chat(`[AYAR] Yeni hedef cevher: ${MADEN_ALANI_BLOK_ISMI}`);
+            startMining(bot);
+        }
     }
 });
 
-// Hata ve Yeniden Bağlanma Yönetimi (7/24 Fix)
+// Hata ve Yeniden Bağlanma Yönetimi
 bot.on('end', () => {
     console.log('[ÇIKTI] Yeniden bağlanmaya çalışılıyor...');
     setTimeout(() => process.exit(1), 15000); 
@@ -234,6 +200,6 @@ bot.on('end', () => {
 
 const http = require('http');
 http.createServer((req, res) => {
-  res.write('Super koruma botu calisiyor...');
+  res.write('Madenci botu calisiyor...');
   res.end();
 }).listen(process.env.PORT || 3000);
